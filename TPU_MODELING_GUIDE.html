@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>sysa_backhand TPU 建模指南</title>
+<style>
+body{max-width:960px;margin:0 auto;padding:36px 22px;font:16px/1.7 system-ui,"Noto Sans SC",sans-serif;color:#202733;background:#f6f8fb}
+h1{line-height:1.25}h2{margin-top:34px;border-bottom:1px solid #dbe2ea;padding-bottom:7px}
+.note{background:#fff;border-left:4px solid #1769aa;padding:14px 18px;margin:18px 0;border-radius:7px}
+.warn{border-left-color:#c78300}code{background:#e8eef4;padding:2px 5px;border-radius:4px}
+pre{background:#17202b;color:#e6edf3;padding:15px;border-radius:7px;overflow:auto}
+pre code{background:none;color:inherit}table{border-collapse:collapse;width:100%;background:#fff}
+th,td{border:1px solid #dbe2ea;padding:9px;text-align:left;vertical-align:top}th{background:#edf3f8}
+</style><body>
+<h1>sysa_backhand TPU 建模指南</h1>
+<p>本项目已有可综合的 16×16 streaming systolic TPU。RTL 在
+<code>src/tpu_stream_top.sv</code>，数值参考模型在
+<code>model/tpu_reference.py</code>。</p>
+<div class="note"><b>建模边界：</b>当前 <code>tpu_stream_top</code> 只有配置、A/B 输入流和结果流，没有 CPU/总线端口。因此先固定 RTL 的数值语义和数据流，再增加 CPU 指令或 MMIO 适配层。</div>
+<h2>1. 当前 TPU 合同</h2>
+<table><tr><th>项目</th><th>定义</th></tr>
+<tr><td>阵列</td><td>16×16 output-stationary PE array</td></tr>
+<tr><td>计算</td><td>INT8：每 PE 每周期一个 MAC；INT4：每 PE 两个 4×4 MAC</td></tr>
+<tr><td>规模</td><td>M/N/K tiling，支持 64×64 及更大 GEMM</td></tr>
+<tr><td>输入</td><td>两个 128-bit ready/valid activation/weight stream</td></tr>
+<tr><td>输出</td><td>32-bit signed，tile-major、tile 内 row-major</td></tr>
+<tr><td>背压</td><td><code>m_result_ready</code> 控制，data/valid/last 必须稳定</td></tr></table>
+<h2>2. 运行参考模型</h2>
+<pre><code>cd /path/to/sysa_backhand
+python3 model/tpu_reference.py --self-test</code></pre>
+<p>它覆盖 INT8、INT4、odd-K、边界 tile 和 RTL 输出顺序，但不模拟周期、stall、综合结构或物理延迟。</p>
+<h2>3. 四层模型</h2>
+<ol><li><b>Reference：</b>验证数值和打包规则。</li>
+<li><b>Stream：</b>加入 128-bit packet、tile loader、ready/valid 和 backpressure。</li>
+<li><b>SystemC：</b>加入 DMA、command queue、MAC latency 和内存带宽。</li>
+<li><b>CPU/system：</b>增加 CPU 可见的 MMIO 或自定义指令，再接入 NEMU/gem5。</li></ol>
+<h2>4. CPU 到 TPU 的接口建议</h2>
+<p>建议先加 command adapter，不改动 PE 阵列：</p>
+<table><tr><th>寄存器</th><th>作用</th></tr>
+<tr><td>CMD_BASE</td><td>命令描述符地址</td></tr><tr><td>A_BASE/B_BASE/C_BASE</td><td>输入和结果矩阵地址</td></tr>
+<tr><td>DIMS</td><td>M/N/K 与 precision</td></tr><tr><td>DOORBELL</td><td>启动 TPU</td></tr>
+<tr><td>STATUS</td><td>busy/done/error</td></tr><tr><td>IRQ</td><td>完成中断</td></tr></table>
+<p>NEMU 先建模寄存器语义，SystemC 再建模 DMA 和周期，真实 RTL 最后接入同一命令协议。</p>
+<h2>5. 验证顺序</h2>
+<ol><li>运行 reference self-test。</li><li>从 <code>tb/tb_tpu_stream_top.sv</code> 复用测试数据和 tile 顺序。</li>
+<li>写 packet-level model，比较 A/B packet 与 output packet。</li>
+<li>建立 SystemC DMA → tile buffer → systolic array → serializer。</li>
+<li>逐项比较 reference、SystemC、RTL。</li><li>最后定义 NEMU MMIO/custom-0 指令。</li></ol>
+<h2>6. 现有验证入口</h2>
+<pre><code>cd tb
+make all                 # 需要 VCS
+cd ..
+TPU_ACCUM_MODE=1 TPU_RUN_TAG=e3_result_q4_serializer_a1 \
+  genus -batch -files synthesis/scripts/syn_genus.tcl \
+  -log synthesis/genus_e3_result_q4_serializer_a1</code></pre>
+<div class="note warn"><b>注意：</b>当前教学版 NEMU 和最新 Abstract Machine 在 <code>panic</code> 宏处存在版本冲突。CPU 接口建模前应固定匹配的 NEMU/AM commit。</div>
+<h2>7. 下一步文件</h2>
+<pre><code>model/tpu_stream_model.py    # packet/ready-valid model
+model/tpu_systemc/            # SystemC TLM/cycle model
+model/cpu_tpu_mmio.h         # CPU-visible register map
+model/nemu/                   # NEMU MMIO/custom instruction patch
+tests/model/                  # 三种模型的对比测试</code></pre>
+</body></html>

@@ -1,0 +1,53 @@
+# Generated and tool-specific files
+.git-local/
+.cadence/
+.agents/
+.codex/
+AN.DB/
+fv/
+*.globals
+*.log*
+*.jou
+*.cmd*
+*.tmp
+*.tstamp
+.batch_start
+*.sdf
+*.vcd
+*.fsdb
+*.wlf
+*.key
+
+# Simulation and synthesis output
+sim/
+checkpoints/
+synthesis/outputs/
+synthesis/checkpoints/*/outputs/
+synthesis/checkpoints/*/reports/
+synthesis/*.log*
+synthesis/*.cmd*
+synthesis/*.v
+synthesis/*.sdc
+dse/results/*/outputs/
+dse/results/*/reports/
+dse/results/*_summary.txt
+synthesis/checkpoints/*_summary.txt
+innovus/
+innovus_temp_*/
+
+# Local tool databases and reports
+*.db
+*.rpt
+*.spef
+*.lib
+*.lef
+*.def
+*.par
+*.enc
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

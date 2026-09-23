@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>16×16 Streaming TPU 架构设计</title>
+  <style>
+    body{font-family:Arial,"Noto Sans SC",sans-serif;line-height:1.65;color:#202124;max-width:1120px;margin:32px auto;padding:0 24px}
+    h1,h2{color:#153b63} h1{border-bottom:3px solid #3c78a8;padding-bottom:10px}
+    h3{color:#286090} table{border-collapse:collapse;width:100%;margin:14px 0 24px}
+    th,td{border:1px solid #c8d2dc;padding:8px 10px;vertical-align:top} th{background:#eaf2f8}
+    code,pre{font-family:Consolas,monospace} pre{background:#f5f7f9;padding:14px;overflow:auto;border-left:4px solid #6a9cc2}
+    .note{background:#fff8e1;border-left:4px solid #e0a800;padding:10px 14px}.ok{background:#eaf7ee;border-left:4px solid #39945a;padding:10px 14px}
+  </style>
+</head>
+<body>
+<h1>16×16 Streaming TPU 架构设计与时序优化框架</h1>
+<p><b>版本：</b>2026-09-08　<b>目标：</b>固定 16×16 physical systolic array，运行时支持 INT8/INT4，分块完成至少 64×64 GEMM，并为 45 nm、1 GHz 物理实现保留优化空间。</p>
+
+<h2>1. 架构目标与边界</h2>
+<ul>
+  <li>物理阵列固定为 16×16，逻辑矩阵通过 M/N/K 三维 tiling 扩展到 64×64 或更大。</li>
+  <li>采用 output-stationary 数据流：A 向东传播，B 向南传播，C partial sum 在阵列计算阶段保持；跨 K tile 累加，最终再 capture/drain。</li>
+  <li>同一套硬件运行时切换 precision：INT8 每个 byte 为一个 signed operand；INT4 每个 byte packed 两个 signed nibble，并在阵列入口拆成两个计算 lane。</li>
+  <li>配置、输入和结果均采用 ready/valid；A、B 两路 loader 可独立 stall；结果端在 backpressure 下必须保持 payload 和 last 标志稳定。</li>
+</ul>
+
+<h2>2. 顶层模块框架</h2>
+<pre>
+Configuration
+  cfg_m/cfg_n/cfg_k, precision_mode, cfg_valid/ready
+             |
+             v
+Tile Scheduler (mt, nt, kt; m_len/n_len/k_len; first/last token)
+   |                 |                  |
+ A Loader        B Loader          Compute/ownership control
+   |                 |                  |
+ independent 128-bit streams and ping-pong banks
+   |                 |
+ A/B packet tile buffer: FF -> bank-local 8:1 mux -> R0 candidates
+                         -> 4:1 bank/half mux -> R1 packet register
+                                      |
+                     packet metadata aligned with data
+                                      |
+                 INT4 unpack / sign extend / odd-K valid
+                                      |
+                 explicit per-lane skew (A row i, B column j)
+                                      |
+                   16x16 output-stationary systolic array
+                                      |
+                  generated row capture: sum/carry result bank
+                                      |
+            quarter-read R0/R1 -> row-local 4-word serializers
+                                      |
+                    final low/high CPA -> 32-bit output
+</pre>
+
+<h2>3. Tile 调度和所有权</h2>
+<p>调度顺序为 <code>mt → nt → kt</code>。每个输出 tile 的 <code>m_len/n_len/k_len</code> 是剩余维度 clamp 到 16 后的寄存值，边界行列通过 valid mask 屏蔽。新的 C tile 在第一个有效 MAC token 初始化 accumulator；后续 K tile 复用同一 accumulator。</p>
+<p>A/B bank 的“读完成”和“计算完成”必须分开定义：</p>
+<table><tr><th>事件</th><th>含义</th><th>用途</th></tr>
+<tr><td>read_done</td><td>最后一个 packet 已从 bank 捕获到 R0/R1</td><td>允许 loader 回收该 bank</td></tr>
+<tr><td>compute_done</td><td>last token 已经过最远端 PE，并完成 accumulator commit</td><td>允许 scheduler 切换计算 bank</td></tr>
+<tr><td>capture_done</td><td>有效结果行已写入 result bank</td><td>允许进入 drain/finalize</td></tr></table>
+<p>状态机不再依赖 <code>k_steps + WAVE_CYCLES</code> 或散落的 <code>+1/+2</code> 猜测，而使用显式 token/事件协议覆盖新增 R0、R1、skew 和 PE hop latency。</p>
+
+<h2>4. A/B 输入与 tile buffer</h2>
+<p>每个 A/B bank 由 16 个 128-bit packet entry 构成。A、B loader 使用独立的 binary pointer、fire、ready 和 bank ownership；一次 handshake 只写入一个完整 128-bit word，不再对每个 byte/lane 做重复 decoder。</p>
+<p>计算读出固定为：</p>
+<pre>buffer FF → bank-local 8:1 mux → R0 candidate registers
+           → 4:1 bank/half mux → R1 packet register
+           → INT4 lane split → per-lane skew pipeline</pre>
+<p>同一 issued packet 的 8-bit 数据、两位 valid、odd-K second-nibble valid、M/N mask、first/last token 和必要的 bank metadata 必须逐级同拍传播。lane 0 也必须经过统一的读边界寄存器，不能保留 memory-to-PE 组合路径。</p>
+
+<h2>5. INT8/INT4 PE 数据流</h2>
+<table><tr><th>阶段</th><th>功能</th></tr>
+<tr><td>M0</td><td>本地寄存 A、B、precision、valid；precision 随 A 传播，避免每个 PE 依赖全局 mode。</td></tr>
+<tr><td>M1</td><td>INT8 产生严格两行部分积；INT4 产生两个独立 4×4 乘积的压缩结果。所有 Booth correction/sign extension 必须先进入平衡 compressor。</td></tr>
+<tr><td>M2</td><td>只保留两行 product sum/product carry shifted，不形成串行多项式加法。</td></tr>
+<tr><td>D</td><td>INT8 直接形成 product；INT4 将两个 8-bit product 合成 delta，并按 signed 语义扩展到 accumulator。</td></tr>
+<tr><td>A</td><td>默认生产候选使用 fused CSA accumulator，first token 选择初始化路径，后续 token 保持 sum/carry 状态；最终 CPA 放到阵列外。</td></tr></table>
+<p>峰值计算吞吐为 256 INT8 MAC/cycle 或 512 INT4 MAC/cycle；这是阵列峰值，不等于受输入、结果带宽和布局时序约束后的持续吞吐。</p>
+
+<h2>6. Result capture、read 和 drain</h2>
+<p>结果保存为独立的 sum/carry bank。capture 使用 generate 固定映射 <code>array_result[row][col] → result_buffer[row][col]</code>，尾 tile 在 <code>capture_row == m_len-1</code> 时停止。</p>
+<p>当前读出采用四组、每组四行的 quarter 结构：</p>
+<pre>16-row result bank
+  -> four group-local 4:1 candidate reads
+  -> R0 candidate registers
+  -> registered quarter select (4:1)
+  -> row-local 4-word serializer
+  -> low/high final CPA
+  -> elastic 32-bit ready/valid output</pre>
+<p>serializer 只有在真正的 <code>valid && ready</code> handshake 时移位；stall 时 data、valid、tile_last、last 全部保持。结果 bank 当前为 single-bank，控制接口预留 dual-bank ownership，以后可重叠下一 C tile capture 与上一 tile drain，但不能突破 32-bit 输出端每个结果至少一个 handshake 周期的带宽上限。</p>
+
+<h2>7. 时序与扇出优化原则</h2>
+<ol>
+  <li>先切断 feeder 的 buffer-to-PE 路径，再处理 scheduler 和 result arithmetic；不要把所有改动一次性合入。</li>
+  <li>用 packet address、issue token 和显式 skew 替代 per-lane <code>feed_cycle - lane</code> 动态索引。</li>
+  <li>控制信号按功能局部化：first/valid token 优先于全阵列 clear；precision 在 job 握手时锁存并沿数据传播；reset 只覆盖必要状态。</li>
+  <li>不要用普通 combinational alias 假装降低 fanout；需要复制时必须有明确的 row/quadrant ownership，并防止综合重新合并。</li>
+  <li>算术路径要先做单 PE/小阵列 DSE，再把赢家放回全阵列；比较行为式乘法、精确 Baugh-Wooley、Booth、分段 CPA 和 fused CSA。</li>
+</ol>
+
+<h2>8. 验证和实现门槛</h2>
+<p>回归必须覆盖 M/N=1、15、16、17；K=1、2、15、16、17、31、32、33；INT8、INT4、odd-K、极值 signed operand、独立 A/B stall、长时间 result stall、多 K tile、bank 边界、reset 各状态和连续不同配置任务。</p>
+<p>必须加入 assertion：pointer 不越界；loader 不覆盖 compute-owned bank；one-hot 控制满足 <code>$onehot0</code>；odd-K valid 正确；输出 stall payload 稳定；接受的 packet 数、产生的结果数和 row-major 顺序一致。</p>
+<p>每个阶段均需执行 lint、定向/完整回归、Genus 综合、setup/hold STA，并比较 WNS/TNS、路径数、fanout/transition/capacitance、mux/FF/buffer、面积、功耗及布局拥塞。当前最新 Genus 结果约为 WNS -85.4 ps、TNS -140.6 ns，仍不能宣称达到 1 GHz。</p>
+
+<div class="note"><b>当前架构判断：</b>quarter-read + local serializer 已经消除了原来的大规模 result drain mux；下一优先级是 scheduler/control、result low-stage CPA/final CSEL 和 feeder R0，而不是继续修改 PE。</div>
+</body>
+</html>
